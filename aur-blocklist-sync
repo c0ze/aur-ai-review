@@ -1,0 +1,225 @@
+#!/bin/bash
+# Fetch campaign package lists and merge them into the aur-ai-review blocklist.
+# Local overlay names are never dropped. Remote names are replaced as a set.
+#
+# There is no official Arch API for "malicious AUR packages". This pulls the
+# downloadable campaign dumps the community actually uses (Arch HedgeDoc +
+# lenucksi campaign files). New one-off reports (hyprland-fixes, …) go in
+# the overlay until a tracker picks them up.
+#
+# Usage:
+#   aur-blocklist-sync                 # write user + system dests if possible
+#   aur-blocklist-sync --dry-run
+#   aur-blocklist-sync --self-test
+#   aur-blocklist-sync --source URL_OR_PATH   (repeatable; skips default file)
+
+set -euo pipefail
+
+CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/paru
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/aur-blocklist-sync
+USER_DEST=$CONF_DIR/aur-blocklist
+USER_LOCAL=$CONF_DIR/aur-blocklist.local
+SYSTEM_DEST=/etc/pacman.d/aur-blocklist
+SYSTEM_LOCAL=/etc/pacman.d/aur-blocklist.local
+DEFAULT_SOURCES=${AUR_BLOCKLIST_SOURCES:-}
+
+here=$(cd "$(dirname -- "$0")" && pwd)
+if [[ -z $DEFAULT_SOURCES ]]; then
+  for candidate in \
+    "$CONF_DIR/aur-blocklist.sources" \
+    /usr/local/share/aur-ai-review/sources \
+    "$here/contrib/sync/sources"
+  do
+    [[ -f $candidate ]] && { DEFAULT_SOURCES=$candidate; break; }
+  done
+fi
+
+PKG_RE='^[a-zA-Z0-9@][a-zA-Z0-9@._+-]*$'
+MIN_REMOTE=${AUR_BLOCKLIST_MIN:-50}
+dry_run=0
+self_test=0
+force=0
+sources=()
+dests=()
+
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \?//'
+}
+
+parse_names() {
+  tr -d '\r' | sed '/^```/d' | grep -E "$PKG_RE" || true
+}
+
+fetch_source() {
+  local src=$1 raw
+  if [[ $src == file://* ]]; then
+    src=${src#file://}
+  fi
+  if [[ -f $src ]]; then
+    cat "$src"
+    return
+  fi
+  curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 --retry 2 "$src"
+}
+
+load_overlay() {
+  local f
+  for f in "$@"; do
+    [[ -f $f ]] || continue
+    parse_names <"$f"
+  done
+}
+
+say() { printf '[aur-blocklist-sync] %s\n' "$*"; }
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --dry-run) dry_run=1 ;;
+    --self-test) self_test=1 ;;
+    --force) force=1 ;;
+    --source)
+      [[ $# -ge 2 ]] || { echo "missing --source argument" >&2; exit 2; }
+      sources+=("$2"); shift
+      ;;
+    --dest)
+      [[ $# -ge 2 ]] || { echo "missing --dest argument" >&2; exit 2; }
+      dests+=("$2"); shift
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
+  esac
+  shift
+done
+
+# --- self-test --------------------------------------------------------------
+if ((self_test)); then
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  mkdir -p "$tmp/paru"
+  printf '%s\n' '# c' 'evil-pkg' 'also-bad' 'third-bad' >"$tmp/remote.txt"
+  printf '%s\n' 'keep-me' >"$tmp/paru/aur-blocklist.local"
+  out=$tmp/paru/aur-blocklist
+  XDG_CONFIG_HOME=$tmp XDG_STATE_HOME=$tmp AUR_BLOCKLIST_MIN=1 \
+    "$0" --force --source "$tmp/remote.txt" --dest "$out" >/dev/null
+  grep -qxF keep-me "$out"
+  grep -qxF evil-pkg "$out"
+  grep -qxF also-bad "$out"
+  # shrinking too far must refuse without --force
+  printf '%s\n' 'tiny' >"$tmp/tiny.txt"
+  if XDG_CONFIG_HOME=$tmp XDG_STATE_HOME=$tmp AUR_BLOCKLIST_MIN=1 \
+      "$0" --source "$tmp/tiny.txt" --dest "$out" >/dev/null 2>"$tmp/err"; then
+    echo "expected shrink guard to fail" >&2
+    exit 1
+  fi
+  grep -qxF keep-me "$out"
+  say "self-test ok"
+  exit 0
+fi
+
+if ((${#sources[@]} == 0)); then
+  [[ -n $DEFAULT_SOURCES && -f $DEFAULT_SOURCES ]] || {
+    echo "no sources file found" >&2
+    exit 1
+  }
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    sources+=("$line")
+  done <"$DEFAULT_SOURCES"
+fi
+
+if ((${#dests[@]} == 0)); then
+  dests+=("$USER_DEST")
+  if [[ -w $(dirname -- "$SYSTEM_DEST") ]] || ((EUID == 0)); then
+    dests+=("$SYSTEM_DEST")
+  fi
+fi
+
+mkdir -p "$STATE_DIR"
+overlay_files=("$USER_LOCAL")
+for dest in "${dests[@]}"; do
+  overlay_files+=("${dest}.local")
+done
+overlay_names=$(load_overlay "${overlay_files[@]}" | sort -u)
+
+remote_tmp=$(mktemp)
+trap 'rm -f "$remote_tmp"' EXIT
+fetched=0
+failed=0
+for src in "${sources[@]}"; do
+  if raw=$(fetch_source "$src"); then
+    names=$(printf '%s\n' "$raw" | parse_names)
+    n=$(printf '%s\n' "$names" | grep -c . || true)
+    say "fetched $n names from $src"
+    printf '%s\n' "$names" >>"$remote_tmp"
+    fetched=$((fetched + 1))
+  else
+    say "FAILED $src"
+    failed=$((failed + 1))
+  fi
+done
+
+if ((fetched == 0)); then
+  echo "all sources failed; leaving blocklist unchanged" >&2
+  exit 1
+fi
+
+remote_names=$(sort -u "$remote_tmp" | grep -E "$PKG_RE" || true)
+remote_count=$(printf '%s\n' "$remote_names" | grep -c . || true)
+prev_count=$(cat "$STATE_DIR/remote.count" 2>/dev/null || echo 0)
+
+if ((remote_count < MIN_REMOTE)) && ((!force)); then
+  echo "remote count $remote_count < minimum $MIN_REMOTE (use --force to apply)" >&2
+  exit 1
+fi
+if ((prev_count > 0)) && ((remote_count * 2 < prev_count)) && ((!force)); then
+  echo "remote count dropped $prev_count → $remote_count (use --force to apply)" >&2
+  exit 1
+fi
+
+merged=$(printf '%s\n%s\n' "$overlay_names" "$remote_names" | grep -E "$PKG_RE" | sort -u)
+total=$(printf '%s\n' "$merged" | grep -c . || true)
+overlay_count=$(printf '%s\n' "$overlay_names" | grep -c . || true)
+
+body=$(cat <<EOF
+# Generated by aur-blocklist-sync $(date -Is). Do not edit.
+# Overlay ($overlay_count names) is merged from aur-blocklist.local
+# Remote ($remote_count names) from campaign dumps — historical, some
+# packages were later cleaned. One-off reports belong in the overlay.
+#
+$merged
+EOF
+)
+
+write_dest() {
+  local dest=$1 dir
+  dir=$(dirname -- "$dest")
+  if ((dry_run)); then
+    say "dry-run: would write $total names to $dest"
+    return
+  fi
+  if [[ ! -w $dir ]] && ((EUID != 0)); then
+    if command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+      printf '%s\n' "$body" | sudo tee "$dest" >/dev/null
+      sudo chmod 644 "$dest"
+      say "wrote $total names to $dest (sudo)"
+      return
+    fi
+    say "skip $dest (not writable; install as root or with sudo)"
+    return
+  fi
+  mkdir -p "$dir"
+  printf '%s\n' "$body" >"$dest"
+  chmod 644 "$dest" 2>/dev/null || true
+  say "wrote $total names to $dest"
+}
+
+for dest in "${dests[@]}"; do
+  write_dest "$dest"
+done
+
+if ((!dry_run)); then
+  printf '%s\n' "$remote_count" >"$STATE_DIR/remote.count"
+  date -Is >"$STATE_DIR/last.ok"
+fi
+
+say "merged $total names (overlay $overlay_count + remote $remote_count, $failed source(s) failed)"

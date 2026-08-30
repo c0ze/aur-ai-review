@@ -104,9 +104,59 @@ sudo install -Dm644 blocklist /etc/pacman.d/aur-blocklist
 **not** stop an explicit `-S` or `-U`. Keep it as a courtesy; the hook
 is the actual block.
 
-Add more names to the blocklist files (one pkgname per line) as reports
-land. After changing `/etc/pacman.d/aur-blocklist`, the next transaction
-picks it up — no daemon reload.
+Add more names to the overlay files (`aur-blocklist.local`, one pkgname
+per line) as reports land. After changing `/etc/pacman.d/aur-blocklist`,
+the next transaction picks it up — no daemon reload.
+
+## Periodic refresh
+
+There is **no official Arch API** for malicious AUR packages. The AUR RPC
+(`https://aur.archlinux.org/rpc/v5/...`) can look up a package; it has no
+malware flag. Arch staff's live artefact is a HedgeDoc pad of campaign
+names (currently the June 2026 wave). Community repos add other waves.
+None of them include later one-off reports such as `hyprland-fixes`.
+
+`aur-blocklist-sync` pulls those dumps, merges them with a local overlay,
+and rewrites the blocklist. Overlay names are never dropped. A fetch that
+returns too few names, or shrinks the remote set by more than half, is
+refused unless you pass `--force`.
+
+```sh
+install -Dm755 aur-blocklist-sync ~/.local/bin/aur-blocklist-sync
+install -Dm644 contrib/sync/sources ~/.config/paru/aur-blocklist.sources
+install -Dm644 blocklist ~/.config/paru/aur-blocklist.local
+
+aur-blocklist-sync --dry-run
+aur-blocklist-sync            # writes ~/.config/paru/aur-blocklist
+aur-blocklist-sync --self-test
+```
+
+Daily timer (user session; updates the paru denylist):
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/user/aur-blocklist-sync.* ~/.config/systemd/user/
+systemctl --user enable --now aur-blocklist-sync.timer
+```
+
+To keep the alpm hook in sync, install the system unit (needs root) so
+`/etc/pacman.d/aur-blocklist` is rewritten too:
+
+```sh
+sudo install -Dm755 aur-blocklist-sync /usr/local/bin/aur-blocklist-sync
+sudo install -Dm644 contrib/sync/sources /usr/local/share/aur-ai-review/sources
+sudo install -Dm644 blocklist /etc/pacman.d/aur-blocklist.local
+sudo install -Dm644 contrib/systemd/aur-blocklist-sync.service \
+  /etc/systemd/system/aur-blocklist-sync.service
+sudo install -Dm644 contrib/systemd/aur-blocklist-sync.timer \
+  /etc/systemd/system/aur-blocklist-sync.timer
+sudo systemctl enable --now aur-blocklist-sync.timer
+```
+
+Those remote lists are **historical campaign names**. Arch often nukes the
+malicious commits and leaves the package. A hit means "this name was
+compromised at least once", not "it is malicious today". The overlay is
+the place for names you want blocked regardless.
 
 ## Requirements
 

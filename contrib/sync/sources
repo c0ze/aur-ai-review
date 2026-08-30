@@ -1,0 +1,13 @@
+# Remote package-name lists. One URL per line.
+# There is no official "currently malicious AUR packages" API. These are
+# campaign snapshots the Arch/community trackers keep as downloadable text.
+#
+# Arch TU HedgeDoc — June 2026 atomic-lockfile / js-digest wave (~1935 names).
+# Posted from aur-general by Jonathan Grotelüschen.
+# Does NOT include later one-off reports (e.g. hyprland-fixes, 2026-08-28).
+https://md.archlinux.org/s/SxbqukK6IA/download
+
+# Community campaign extras (lenucksi/aur-malware-check).
+https://raw.githubusercontent.com/lenucksi/aur-malware-check/master/data/campaigns/aur-infected/packages-extra.txt
+https://raw.githubusercontent.com/lenucksi/aur-malware-check/master/data/campaigns/chaos-rat/packages.txt
+https://raw.githubusercontent.com/lenucksi/aur-malware-check/master/data/campaigns/russian-spam/packages.txt
