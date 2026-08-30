@@ -44,6 +44,10 @@ A non-zero exit aborts the install.
    the agent being unreachable — asks `y/N` on the terminal. No terminal,
    no `y` → the build is refused.
 
+A **hard denylist** runs before the agent, and before `AUR_REVIEW=off`.
+If the pkgname is in `~/.config/paru/aur-blocklist` or
+`/etc/pacman.d/aur-blocklist`, the build is refused with no prompt.
+
 Every verdict is appended to `~/.local/state/aur-ai-review/reviews.log`.
 
 Agents with tool access (e.g. Kimi) may go beyond the diff and inspect
@@ -66,12 +70,43 @@ EOF
 
 (Adjust the path; `~` is not expanded in paru.conf.)
 
+Optional — seed the denylist (ships with `hyprland-fixes` from the
+2026-08-28 aur-general report):
+
+```sh
+install -Dm644 blocklist ~/.config/paru/aur-blocklist
+```
+
 Test your setup without a real AUR update:
 
 ```sh
 aur-ai-review --self-test             # benign PKGBUILD, expect VERDICT: SAFE
 aur-ai-review --self-test suspicious  # curl|bash installer, expect a block prompt
+aur-ai-review --self-test blocklist   # expect exit 1 (hard refuse)
 ```
+
+## Pacman hook (blocks `pacman -U` too)
+
+The paru hook only runs on AUR builds. An already-built package
+(`pacman -U`, a GUI helper, a cached `.pkg.tar.zst`) never hits it.
+The alpm hook refuses Install/Upgrade of any name in
+`/etc/pacman.d/aur-blocklist`, regardless of how it got there.
+
+```sh
+sudo install -Dm755 contrib/pacman/check-aur-blocklist \
+  /usr/local/lib/pacman/check-aur-blocklist
+sudo install -Dm644 contrib/pacman/00-aur-blocklist.hook \
+  /etc/pacman.d/hooks/00-aur-blocklist.hook
+sudo install -Dm644 blocklist /etc/pacman.d/aur-blocklist
+```
+
+`IgnorePkg` in `/etc/pacman.conf` / paru.conf only skips `-Syu`. It does
+**not** stop an explicit `-S` or `-U`. Keep it as a courtesy; the hook
+is the actual block.
+
+Add more names to the blocklist files (one pkgname per line) as reports
+land. After changing `/etc/pacman.d/aur-blocklist`, the next transaction
+picks it up — no daemon reload.
 
 ## Requirements
 
@@ -85,7 +120,7 @@ aur-ai-review --self-test suspicious  # curl|bash installer, expect a block prom
 
 | Env var | Default | What it does |
 |---|---|---|
-| `AUR_REVIEW` | `on` | `AUR_REVIEW=off paru -S foo` skips the review entirely |
+| `AUR_REVIEW` | `on` | `AUR_REVIEW=off paru -S foo` skips the **agent** review. The denylist still runs. |
 | `AUR_REVIEW_AGENT` | `kimi` | Agent CLI to use (`claude`, `codex`, …) |
 
 The agent binary is resolved from `PATH`, then `~/.kimi-code/bin`,

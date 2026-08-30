@@ -1,0 +1,7 @@
+# Known-malicious AUR packages. One pkgname per line.
+# Comments and blank lines are ignored.
+#
+# hyprland-fixes — 2026-08-28 aur-general: post-install harvested sudo,
+# joined an attacker Tailscale network, spawned root sshd on 3333/4444.
+# https://lists.archlinux.org/archives/list/aur-general@lists.archlinux.org/thread/TAASU6LTO76UCKYLMG25OJPUY7ZONASN/
+hyprland-fixes

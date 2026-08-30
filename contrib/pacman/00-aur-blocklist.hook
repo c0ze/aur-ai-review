@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Enforce /etc/pacman.d/aur-blocklist
+When = PreTransaction
+AbortOnFail
+NeedsTargets
+Exec = /usr/local/lib/pacman/check-aur-blocklist

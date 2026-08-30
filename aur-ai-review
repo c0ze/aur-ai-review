@@ -9,24 +9,51 @@
 # SAFE records the commit as reviewed and lets the build through. Anything
 # else (including agent failure) asks on /dev/tty whether to proceed.
 #
-# Config: AUR_REVIEW=off disables entirely, AUR_REVIEW_AGENT=claude|codex|...
-# swaps the reviewer. State + log live in
+# Config: AUR_REVIEW=off disables the agent review (not the denylist).
+# AUR_REVIEW_AGENT=claude|codex|... swaps the reviewer. State + log live in
 # ${XDG_STATE_HOME:-~/.local/state}/aur-ai-review/.
 #
-# Manual test: `aur-ai-review --self-test [safe|suspicious]` reviews a
-# synthetic PKGBUILD in a temp dir (safe = benign, suspicious = curl|bash
-# installer that should trigger the block/ack path).
+# Hard denylist (not bypassable with AUR_REVIEW=off), one pkgname per line:
+#   ${XDG_CONFIG_HOME:-~/.config}/paru/aur-blocklist
+#   /etc/pacman.d/aur-blocklist
+#
+# Manual test: `aur-ai-review --self-test [safe|suspicious|blocklist]`
+# safe/suspicious review a synthetic PKGBUILD; blocklist expects exit 1.
 
 set -u
+
+name_in_blocklist() {
+  local name=$1 file=$2
+  [[ -f $file ]] || return 1
+  grep -vE '^[[:space:]]*(#|$)' "$file" | grep -qxF -- "$name"
+}
+
+refuse_if_blocked() {
+  local name=$1 file
+  for file in \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/paru/aur-blocklist" \
+    /etc/pacman.d/aur-blocklist
+  do
+    if name_in_blocklist "$name" "$file"; then
+      printf '\033[1;31m[aur-ai-review]\033[0m %s is on the AUR blocklist (%s). Refusing to build.\n' "$name" "$file"
+      exit 1
+    fi
+  done
+}
 
 # --- self-test ---------------------------------------------------------------
 if [[ ${1:-} == "--self-test" ]]; then
   flavor=${2:-safe}
   selftest_dir=$(mktemp -d /tmp/aur-ai-review-test.XXXXXX)
   trap 'rm -rf "$selftest_dir"' EXIT
-  cd "$selftest_dir" || exit 1
-  if [[ $flavor == suspicious ]]; then
-    cat >PKGBUILD <<'EOF'
+  if [[ $flavor == blocklist ]]; then
+    mkdir -p "$selftest_dir/config/paru"
+    printf '%s\n' '# comment' 'evil-pkg' '' >"$selftest_dir/config/paru/aur-blocklist"
+    export XDG_CONFIG_HOME="$selftest_dir/config" PKGBASE=evil-pkg VERSION=selftest
+  else
+    cd "$selftest_dir" || exit 1
+    if [[ $flavor == suspicious ]]; then
+      cat >PKGBUILD <<'EOF'
 pkgname=totally-legit
 pkgver=1.0
 pkgrel=1
@@ -38,8 +65,8 @@ package() {
   install -Dm755 /dev/null "$pkgdir/usr/bin/totally-legit"
 }
 EOF
-  else
-    cat >PKGBUILD <<'EOF'
+    else
+      cat >PKGBUILD <<'EOF'
 pkgname=hello-safe
 pkgver=1.0
 pkgrel=1
@@ -50,8 +77,9 @@ package() {
   install -Dm755 /dev/null "$pkgdir/usr/bin/hello-safe"
 }
 EOF
+    fi
+    export PKGBASE="selftest-$flavor" VERSION=selftest
   fi
-  export PKGBASE="selftest-$flavor" VERSION=selftest
 fi
 
 # --- context fix ------------------------------------------------------------
@@ -73,6 +101,14 @@ fi
 AGENT=${AUR_REVIEW_AGENT:-kimi}
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/aur-ai-review
 MAX_BYTES=60000
+pkgbase=${PKGBASE:-$(basename "$PWD")}
+
+# Hard denylist. Checked before AUR_REVIEW=off so it cannot be skipped.
+refuse_if_blocked "$pkgbase"
+if [[ ${1:-} == "--self-test" && ${2:-} == "blocklist" ]]; then
+  printf '\033[1;31m[aur-ai-review]\033[0m blocklist self-test failed: evil-pkg was not refused.\n'
+  exit 2
+fi
 
 [[ ${AUR_REVIEW:-on} == "off" ]] && exit 0
 
@@ -89,7 +125,6 @@ resolve_agent() {
   return 1
 }
 
-pkgbase=${PKGBASE:-$(basename "$PWD")}
 version=${VERSION:-unknown}
 mkdir -p "$STATE_DIR"
 state_file="$STATE_DIR/$pkgbase.commit"

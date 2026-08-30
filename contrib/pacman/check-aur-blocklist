@@ -1,0 +1,18 @@
+#!/bin/sh
+# alpm PreTransaction hook. Reads package names on stdin (NeedsTargets)
+# and aborts if any match /etc/pacman.d/aur-blocklist.
+list=${AUR_BLOCKLIST:-/etc/pacman.d/aur-blocklist}
+[ -f "$list" ] || exit 0
+
+blocked=$(grep -vE '^[[:space:]]*(#|$)' "$list" || true)
+[ -n "$blocked" ] || exit 0
+
+while IFS= read -r pkg; do
+  name=${pkg%% *}
+  [ -n "$name" ] || continue
+  if printf '%s\n' "$blocked" | grep -qxF -- "$name"; then
+    echo "Refusing $name: listed in $list" >&2
+    exit 1
+  fi
+done
+exit 0
